@@ -16,18 +16,22 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 import java.io.FileInputStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Set;
+import java.util.jar.JarFile;
 import java.util.stream.Collectors;
 
 import com.paypal.digraph.parser.GraphEdge;
 import com.paypal.digraph.parser.GraphNode;
 import com.paypal.digraph.parser.GraphParser;
 
+import de.sormuras.bartholdy.Configuration;
 import de.sormuras.bartholdy.jdk.Jdeps;
 
+import org.apache.commons.io.FileUtils;
 import org.jgrapht.graph.DefaultEdge;
 import org.jgrapht.graph.DirectedAcyclicGraph;
 import org.junit.jupiter.api.BeforeAll;
@@ -43,6 +47,8 @@ import platform.tooling.support.Request;
  */
 class JdepsTests {
 
+	private static Path WORKSPACE = Request.WORKSPACE.resolve("jdeps-dot-files");
+
 	private static Set<String> KNOWN_BAD_EDGES = Set.of(
 		"org.junit.jupiter.engine.descriptor.TestInstanceLifecycleUtils -> org.junit.jupiter.engine.Constants",
 		"org.junit.jupiter.engine.discovery.JavaElementsResolver -> org.junit.jupiter.engine.JupiterTestEngine",
@@ -56,27 +62,32 @@ class JdepsTests {
 
 	@BeforeAll
 	static void setup() {
-		Helper.loadModuleDirectoryNames().stream().parallel().forEach(JdepsTests::runJdepsFor);
+		FileUtils.deleteQuietly(WORKSPACE.toFile());
+		Helper.loadModuleDirectoryNames().stream().parallel().forEach(JdepsTests::createDotFiles);
 	}
 
-	private static void runJdepsFor(String module) {
-		var version = Helper.version(module);
-		var archive = module + '-' + version + ".jar";
-		var destination = Paths.get("build", "test-workspace", "jdeps-tests-modules", module);
-		var builder = Request.builder() //
-				.setTool(new Jdeps()) //
-				.setProject("jdeps-cycle-check") //
-				.setWorkspace("jdeps-cycle-check/" + module);
+	private static void createDotFiles(String module) {
+		var archive = module + '-' + Helper.version(module) + ".jar";
+		var path = Paths.get("..", module, "build", "libs", archive);
 
-		if (module.equals("junit-platform-commons")) {
-			builder.addArguments("--multi-release", 9);
+		var builder = Configuration.builder();
+		try (var jar = new JarFile(path.toFile())) {
+			if (jar.isMultiRelease()) {
+				builder.addArgument("--multi-release");
+				builder.addArgument(9);
+			}
+		}
+		catch (Exception e) {
+			fail("loading jar file failed", e);
 		}
 
-		var result = builder.addArguments("--dot-output", destination) //
-				.addArguments("-verbose") // -verbose:class -filter:none ... filter "$" types
-				.addArguments(Paths.get("..", module, "build", "libs", archive)) //
-				.build() //
-				.run();
+		var destination = WORKSPACE.resolve(module);
+		var configuration = builder.addArgument("--dot-output").addArgument(destination) //
+				.addArgument("-verbose") // -verbose:class -filter:none ... filter "$" types
+				.addArgument(path) // junit-{module}-{version}.jar
+				.build();
+
+		var result = new Jdeps().run(configuration);
 
 		assertEquals(0, result.getExitCode(), "result = " + result);
 		assertEquals("", result.getOutput("err"), "error log isn't empty");
@@ -95,30 +106,32 @@ class JdepsTests {
 		}
 	}
 
-	@ParameterizedTest
-	@MethodSource("platform.tooling.support.Helper#loadModuleDirectoryNames")
-	void modules(String module) throws Exception {
-		var version = Helper.version(module);
-		var archive = module + '-' + version + ".jar";
-		var destination = Paths.get("build", "test-workspace", "jdeps-tests-modules", module);
+	private static GraphParser parseGraph(String module) {
+		var archive = module + '-' + Helper.version(module) + ".jar";
+		var destination = WORKSPACE.resolve(module);
 		var raw = destination.resolve(archive + ".raw.dot");
 
-		var parser = new GraphParser(new FileInputStream(raw.toFile()));
-		var expectedPackagePrefix = "org." + module.replace('-', '.');
+		try {
+			return new GraphParser(new FileInputStream(raw.toFile()));
+		}
+		catch (Exception e) {
+			throw new AssertionError("parsing graph failed", e);
+		}
+	}
 
-		assertGraphIsAcyclic(Set.of(parser), expectedPackagePrefix);
+	@ParameterizedTest
+	@MethodSource("platform.tooling.support.Helper#loadModuleDirectoryNames")
+	void modules(String module) {
+		var parsers = Set.of(parseGraph(module));
+
+		assertGraphIsAcyclic(parsers, "org." + module.replace('-', '.'));
 	}
 
 	@Test
-	void all() throws Exception {
+	void all() {
 		var parsers = new ArrayList<GraphParser>();
 		for (var module : Helper.loadModuleDirectoryNames()) {
-			var version = Helper.version(module);
-			var archive = module + '-' + version + ".jar";
-			var destination = Paths.get("build", "test-workspace", "jdeps-tests-modules", module);
-			var raw = destination.resolve(archive + ".raw.dot");
-
-			parsers.add(new GraphParser(new FileInputStream(raw.toFile())));
+			parsers.add(parseGraph(module));
 		}
 
 		assertGraphIsAcyclic(parsers, "org.junit");
